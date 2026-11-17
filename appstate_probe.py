@@ -42,14 +42,40 @@ except Exception:
 # 工具输出
 # ---------------------------------------------------------------------------
 
+def _ensure_utf8_stdio() -> None:
+    """Windows CI/控制台默认可能是 charmap，避免中文输出炸掉。"""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None:
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+
+_ensure_utf8_stdio()
+
+
 def _print(*args, **kwargs) -> None:
     kwargs.setdefault("flush", True)
-    print(*args, **kwargs)
+    try:
+        print(*args, **kwargs)
+    except UnicodeEncodeError:
+        text = " ".join(str(a) for a in args)
+        kwargs.pop("file", None)
+        sys.stdout.buffer.write((text + "\n").encode("utf-8", errors="replace"))
+        sys.stdout.buffer.flush()
 
 
 def _eprint(*args, **kwargs) -> None:
     kwargs.setdefault("flush", True)
-    print(*args, file=sys.stderr, **kwargs)
+    try:
+        print(*args, file=sys.stderr, **kwargs)
+    except UnicodeEncodeError:
+        text = " ".join(str(a) for a in args)
+        sys.stderr.buffer.write((text + "\n").encode("utf-8", errors="replace"))
+        sys.stderr.buffer.flush()
 
 
 # ---------------------------------------------------------------------------
