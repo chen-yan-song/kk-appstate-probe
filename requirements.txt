@@ -1,0 +1,5 @@
+# 可选：加速 find-root / unwrap（无则自动回退纯 Python）
+cryptography>=41.0.0
+
+# 仅打包时需要
+# pyinstaller>=6.0.0
