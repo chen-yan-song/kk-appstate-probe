@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 # 供 PyInstaller 收集（运行时仍可回退纯 Python）
 try:
@@ -1038,22 +1038,22 @@ def cmd_find_root(args: argparse.Namespace) -> int:
     known_dek_by_path = {ent.relpath: dek for ent, dek in known_matched}
 
     def _accept_root(cand: bytes) -> bool:
+        """有已知 DEK 时：任意一条 unwrap==已知即可（避免旧缓存 DEK 误拒）。
+        无已知时：至少 1 条 ICV 通过，另抽查最多 2 条。"""
+        if known_dek_by_path:
+            for ent, expect in known_matched:
+                got = try_unwrap_one(cand, st.salt, st.info_prefix, ent.relpath, ent.wrapped)
+                if got is not None and got == expect:
+                    return True
+            return False
         dek0 = try_unwrap_one(cand, st.salt, st.info_prefix, probes[0].relpath, probes[0].wrapped)
         if dek0 is None:
-            return False
-        expect0 = known_dek_by_path.get(probes[0].relpath)
-        if expect0 is not None and dek0 != expect0:
             return False
         ok_extra = 0
         need = max(0, min(2, len(probes) - 1))
         for p in probes[1:]:
-            got = try_unwrap_one(cand, st.salt, st.info_prefix, p.relpath, p.wrapped)
-            if got is None:
-                continue
-            expect = known_dek_by_path.get(p.relpath)
-            if expect is not None and got != expect:
-                continue
-            ok_extra += 1
+            if try_unwrap_one(cand, st.salt, st.info_prefix, p.relpath, p.wrapped) is not None:
+                ok_extra += 1
         return ok_extra >= need
 
     checked = 0
