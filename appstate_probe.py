@@ -28,9 +28,9 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Any, Iterable, Iterator
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # 供 PyInstaller 收集（运行时仍可回退纯 Python）
 try:
@@ -566,8 +566,17 @@ def find_kakao_pids() -> list[int]:
     return sorted(set(pids))
 
 
-def dump_process_private_rw(pid: int, max_bytes: int = 1536 * 1024 * 1024) -> bytes:
-    """转储指定进程的已提交、私有、可读写内存。"""
+def dump_process_memory(
+    pid: int,
+    max_bytes: int = 1536 * 1024 * 1024,
+    *,
+    writable_only: bool = False,
+) -> bytes:
+    """转储进程已提交可读内存。
+
+    默认：私有 + 可读（含只读），因运行时根钥 R 可能不在可写堆上。
+    writable_only=True 时退回旧行为（仅私有可写）。
+    """
     if not _is_windows():
         raise RuntimeError("仅 Windows 支持内存转储")
     import ctypes
@@ -610,7 +619,10 @@ def dump_process_private_rw(pid: int, max_bytes: int = 1536 * 1024 * 1024) -> by
             readable = (prot & PAGE_READABLE) and not (prot & PAGE_GUARD) and prot != PAGE_NOACCESS
             writable = bool(prot & PAGE_WRITABLE)
             private = typ == MEM_PRIVATE
-            if state == MEM_COMMIT and readable and writable and private:
+            take = state == MEM_COMMIT and readable and private
+            if take and writable_only:
+                take = writable
+            if take:
                 remain = max_bytes - total
                 to_read = min(size, remain)
                 buf = (ctypes.c_char * to_read)()
@@ -629,6 +641,11 @@ def dump_process_private_rw(pid: int, max_bytes: int = 1536 * 1024 * 1024) -> by
     finally:
         kernel32.CloseHandle(handle)
     return b"".join(chunks)
+
+
+def dump_process_private_rw(pid: int, max_bytes: int = 1536 * 1024 * 1024) -> bytes:
+    """兼容旧名：仅私有可写。"""
+    return dump_process_memory(pid, max_bytes=max_bytes, writable_only=True)
 
 
 # ---------------------------------------------------------------------------
@@ -861,6 +878,44 @@ def _regions_near_needles(blob: bytes, needles: list[bytes], radius: int) -> lis
     return merged
 
 
+def _hex_to_dek32(hx: str) -> bytes | None:
+    try:
+        dek = bytes.fromhex(str(hx).strip().lower().replace("0x", "").replace(" ", ""))
+    except ValueError:
+        return None
+    return dek if len(dek) == 32 else None
+
+
+def _extract_key_map(data: Any) -> dict[str, str]:
+    """兼容 win-key-cache / unwrap 导出 / 查看器多种形态 → {name_or_path: hex}。"""
+    out: dict[str, str] = {}
+    if isinstance(data, list):
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            hx = item.get("keyHex") or item.get("key_hex") or item.get("hex")
+            name = item.get("probe") or item.get("edb") or item.get("name") or item.get("path") or ""
+            if hx and name:
+                out[str(name)] = str(hx)
+        return out
+    if not isinstance(data, dict):
+        return {}
+    if isinstance(data.get("keys"), dict):
+        return {str(k): str(v) for k, v in data["keys"].items() if v}
+    if isinstance(data.get("byName"), dict):
+        return {str(k): str(v) for k, v in data["byName"].items() if v}
+    if isinstance(data.get("sample_keys"), dict):
+        return {str(k): str(v) for k, v in data["sample_keys"].items() if v}
+    # 扁平 {name: hex}；忽略明显非密钥字段
+    skip = {"version", "appstate", "info_prefix", "salt_hex", "root_hex", "ok", "fail", "hits"}
+    for k, v in data.items():
+        if k in skip or not isinstance(v, str):
+            continue
+        if len(v.replace("0x", "").replace(" ", "")) == 64:
+            out[str(k)] = v
+    return out
+
+
 def _parse_known_deks(args: argparse.Namespace) -> list[tuple[bytes, bytes]]:
     """返回 [(relpath_bytes_or_empty, dek32), ...]。"""
     out: list[tuple[bytes, bytes]] = []
@@ -869,21 +924,49 @@ def _parse_known_deks(args: argparse.Namespace) -> list[tuple[bytes, bytes]]:
             if "=" not in item:
                 raise ValueError("--known-dek 格式: 相对路径=64hex  或  =64hex")
             path_s, hx = item.split("=", 1)
-            dek = bytes.fromhex(hx.strip().lower().replace("0x", ""))
-            if len(dek) != 32:
-                raise ValueError("known DEK 必须 32 字节")
+            dek = _hex_to_dek32(hx)
+            if dek is None:
+                raise ValueError("known DEK 必须 32 字节 hex")
             rel = path_s.encode("utf-8") if path_s else b""
             out.append((rel, dek))
     if args.known_keys:
         data = json.loads(Path(args.known_keys).read_text(encoding="utf-8"))
-        keys = data.get("keys") if isinstance(data, dict) else data
-        if not isinstance(keys, dict):
-            raise ValueError("known-keys JSON 需要 keys 对象或纯 path→hex 映射")
-        for p, hx in keys.items():
-            dek = bytes.fromhex(str(hx).strip().lower().replace("0x", ""))
-            if len(dek) == 32:
+        key_map = _extract_key_map(data)
+        if not key_map:
+            raise ValueError("known-keys 未解析到任何 32 字节密钥（支持 win-key-cache.json）")
+        for p, hx in key_map.items():
+            dek = _hex_to_dek32(hx)
+            if dek is not None:
                 out.append((str(p).encode("utf-8"), dek))
     return out
+
+
+def _match_known_to_entries(
+    known: list[tuple[bytes, bytes]],
+    entries: list[WrapEntry],
+) -> list[tuple[WrapEntry, bytes]]:
+    """把缓存里的短名/路径对齐到 appstate 条目。"""
+    by_name: dict[bytes, WrapEntry] = {}
+    by_full: dict[bytes, WrapEntry] = {}
+    for e in entries:
+        by_full[e.relpath] = e
+        name = e.relpath.replace(b"\\", b"/").split(b"/")[-1]
+        by_name[name] = e
+    matched: list[tuple[WrapEntry, bytes]] = []
+    seen: set[bytes] = set()
+    for rel, dek in known:
+        if not rel:
+            continue
+        ent = by_full.get(rel) or by_name.get(rel.replace(b"\\", b"/").split(b"/")[-1])
+        if ent is None:
+            # 缓存键可能是 chatLogs_xxx.edb 无前缀
+            name = rel.replace(b"\\", b"/").split(b"/")[-1]
+            ent = by_name.get(name)
+        if ent is None or ent.relpath in seen:
+            continue
+        seen.add(ent.relpath)
+        matched.append((ent, dek))
+    return matched
 
 
 def cmd_find_root(args: argparse.Namespace) -> int:
@@ -897,6 +980,13 @@ def cmd_find_root(args: argparse.Namespace) -> int:
     _print(f"探测条目: {len(probes)}  前缀={st.info_prefix!r}  salt={st.salt.hex()[:16]}…")
 
     known = _parse_known_deks(args)
+    known_matched = _match_known_to_entries(known, st.chatlog_entries or st.entries)
+    if known:
+        _print(f"已知 DEK: {len(known)} 条，对齐 appstate: {len(known_matched)} 条")
+        # 有对齐条目时，优先用它们做 ICV 探测（并可核对明文 DEK）
+        if known_matched:
+            probes = [ent for ent, _ in known_matched[: max(1, args.probe_count)]]
+
     if args.dump_file:
         blob = Path(args.dump_file).read_bytes()
         _print(f"已加载 dump: {args.dump_file}  size={len(blob)}")
@@ -906,10 +996,17 @@ def cmd_find_root(args: argparse.Namespace) -> int:
             _eprint("未找到 KakaoTalk.exe 进程，请先登录并保持客户端运行。")
             return 2
         _print(f"KakaoTalk PID: {pids}")
+        writable_only = bool(getattr(args, "writable_only", False))
+        mode = "仅私有可写" if writable_only else "私有可读(含只读)"
+        _print(f"转储模式: {mode}")
         parts = []
         for pid in pids:
             _print(f"转储 PID {pid} …")
-            part = dump_process_private_rw(pid, max_bytes=args.max_dump_mb * 1024 * 1024)
+            part = dump_process_memory(
+                pid,
+                max_bytes=args.max_dump_mb * 1024 * 1024,
+                writable_only=writable_only,
+            )
             _print(f"  得到 {len(part)} 字节")
             parts.append(part)
         blob = b"".join(parts)
@@ -921,14 +1018,43 @@ def cmd_find_root(args: argparse.Namespace) -> int:
     scan_plan: list[tuple[str, Iterable[tuple[int, bytes]]]] = []
     if known:
         needles = [dek for _, dek in known]
+        hit_count = sum(blob.count(nd) for nd in needles)
         regions = _regions_near_needles(blob, needles, radius=args.near_radius)
-        _print(f"已知 DEK 命中邻域: {len(regions)} 段")
-        def near_iter():
-            for a, b in regions:
-                for off, cand in _iter_candidates(blob[a:b], step=args.step):
-                    yield a + off, cand
-        scan_plan.append(("near-known-dek", near_iter()))
-    scan_plan.append(("full", _iter_candidates(blob, step=args.step)))
+        _print(f"已知 DEK 在 dump 中出现次数≈{hit_count}，邻域段数={len(regions)}，半径={args.near_radius}")
+        if hit_count == 0:
+            _eprint("警告: 缓存里的 DEK 字节未出现在当前内存。请先在 KakaoTalk 打开对应聊天室再扫。")
+        else:
+            def near_iter():
+                for a, b in regions:
+                    for off, cand in _iter_candidates(blob[a:b], step=args.step):
+                        yield a + off, cand
+            scan_plan.append(("near-known-dek", near_iter()))
+    if not getattr(args, "known_only", False):
+        scan_plan.append(("full", _iter_candidates(blob, step=args.step)))
+    elif not scan_plan:
+        _eprint("指定了 --known-only，但没有可用邻域（DEK 未驻留内存）。")
+        return 4
+
+    known_dek_by_path = {ent.relpath: dek for ent, dek in known_matched}
+
+    def _accept_root(cand: bytes) -> bool:
+        dek0 = try_unwrap_one(cand, st.salt, st.info_prefix, probes[0].relpath, probes[0].wrapped)
+        if dek0 is None:
+            return False
+        expect0 = known_dek_by_path.get(probes[0].relpath)
+        if expect0 is not None and dek0 != expect0:
+            return False
+        ok_extra = 0
+        need = max(0, min(2, len(probes) - 1))
+        for p in probes[1:]:
+            got = try_unwrap_one(cand, st.salt, st.info_prefix, p.relpath, p.wrapped)
+            if got is None:
+                continue
+            expect = known_dek_by_path.get(p.relpath)
+            if expect is not None and got != expect:
+                continue
+            ok_extra += 1
+        return ok_extra >= need
 
     checked = 0
     t0 = time.time()
@@ -942,34 +1068,24 @@ def cmd_find_root(args: argparse.Namespace) -> int:
             checked += 1
             if checked % 200000 == 0:
                 _print(f"  …已试 {checked} 个候选  elapsed={time.time()-t0:.1f}s")
-            # 快速过滤：全零 / 低熵粗略跳过
             if cand == b"\x00" * 32 or cand == b"\xff" * 32:
                 continue
-            dek0 = try_unwrap_one(cand, st.salt, st.info_prefix, probes[0].relpath, probes[0].wrapped)
-            if dek0 is None:
+            if not _accept_root(cand):
                 continue
-            # 再确认另外几条
-            ok_extra = 0
-            for p in probes[1:]:
-                if try_unwrap_one(cand, st.salt, st.info_prefix, p.relpath, p.wrapped) is not None:
-                    ok_extra += 1
-            need = max(0, min(2, len(probes) - 1))
-            if ok_extra >= need:
-                found_root = cand
-                found_at = off
-                break
+            found_root = cand
+            found_at = off
+            break
         if found_root is not None:
             break
 
     elapsed = time.time() - t0
     if found_root is None:
         _eprint(f"未找到根钥。已试候选={checked} 用时={elapsed:.1f}s phase={phase_name}")
-        _eprint("建议：先开几个聊天室；或传入 --known-dek（来自现有 memscan 缓存）加速邻域扫描。")
+        _eprint("建议：打开已解过钥的聊天室后再扫；或加大 --near-radius；或去掉 --known-only 做扩大 dump 全扫。")
         return 4
 
     _print(f"[HIT] 找到 R @ dump_offset={found_at}  phase={phase_name}")
     _print(f"R = {found_root.hex()}")
-    # 批量解包一小份样例
     sample_keys = {}
     for e in (st.chatlog_entries or st.entries)[:20]:
         dek = try_unwrap_one(found_root, st.salt, st.info_prefix, e.relpath, e.wrapped)
@@ -1032,8 +1148,10 @@ def build_parser() -> argparse.ArgumentParser:
     p3.add_argument("--step", type=int, default=4, help="候选窗口步进（字节）")
     p3.add_argument("--probe-count", type=int, default=3)
     p3.add_argument("--known-dek", action="append", default=[], help="path=64hex，可重复；加速邻域扫描")
-    p3.add_argument("--known-keys", help="已有 keys JSON（含 keys 映射）")
-    p3.add_argument("--near-radius", type=int, default=2 * 1024 * 1024)
+    p3.add_argument("--known-keys", help="已有 keys JSON（win-key-cache.json / unwrap 导出均可）")
+    p3.add_argument("--known-only", action="store_true", help="只扫已知 DEK 邻域，不做全量")
+    p3.add_argument("--writable-only", action="store_true", help="仅转储私有可写（旧行为）；默认含只读私有")
+    p3.add_argument("--near-radius", type=int, default=4 * 1024 * 1024, help="已知 DEK 邻域半径，默认 4MB")
     p3.add_argument("--out", default="kk-root-key.json")
     p3.set_defaults(func=cmd_find_root)
 
