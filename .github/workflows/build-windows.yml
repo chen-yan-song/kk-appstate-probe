@@ -1,0 +1,38 @@
+name: 打包 Windows exe
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖并自检
+        run: |
+          python -m pip install -U pip pyinstaller cryptography
+          python appstate_probe.py selftest
+
+      - name: PyInstaller 打包
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --console --name kk-appstate-probe --hidden-import cryptography.hazmat.primitives.keywrap appstate_probe.py
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: kk-appstate-probe-windows
+          path: dist/kk-appstate-probe.exe
+          if-no-files-found: error
+          retention-days: 14
