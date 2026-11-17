@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 # 供 PyInstaller 收集（运行时仍可回退纯 Python）
 try:
@@ -930,7 +930,8 @@ def _parse_known_deks(args: argparse.Namespace) -> list[tuple[bytes, bytes]]:
             rel = path_s.encode("utf-8") if path_s else b""
             out.append((rel, dek))
     if args.known_keys:
-        data = json.loads(Path(args.known_keys).read_text(encoding="utf-8"))
+        # Windows PowerShell Set-Content -Encoding UTF8 会写 BOM
+        data = json.loads(Path(args.known_keys).read_text(encoding="utf-8-sig"))
         key_map = _extract_key_map(data)
         if not key_map:
             raise ValueError("known-keys 未解析到任何 32 字节密钥（支持 win-key-cache.json）")
