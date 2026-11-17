@@ -1040,16 +1040,46 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+def _pause_if_double_clicked() -> None:
+    """双击运行时控制台会立刻关掉；无参数/失败时暂停，方便看输出。"""
+    if not _is_windows():
+        return
+    # 有父控制台且是交互传入参数时不暂停
+    if len(sys.argv) > 1:
+        return
     try:
-        return int(args.func(args))
+        input("\n按回车键退出…")
+    except Exception:
+        pass
+
+
+def main(argv: list[str] | None = None) -> int:
+    # 双击无参数：默认跑 inspect，避免一闪而过只看到用法错误
+    if argv is None and len(sys.argv) <= 1:
+        argv = ["inspect"]
+        _print("未指定命令，默认执行: inspect")
+        _print("完整用法示例:")
+        _print("  kk-appstate-probe.exe inspect")
+        _print("  kk-appstate-probe.exe find-root --appstate \"%LOCALAPPDATA%\\Kakao\\KakaoTalk\\users\\<账号>\\appstate.dat\"")
+        _print("")
+    parser = build_parser()
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as e:
+        code = int(e.code or 0) if isinstance(e.code, int) or e.code is None else 1
+        if len(sys.argv) <= 1:
+            _pause_if_double_clicked()
+        return code
+    try:
+        code = int(args.func(args))
     except BrokenPipeError:
         return 0
     except Exception as e:
         _eprint(f"[错误] {e}")
-        return 1
+        code = 1
+    if argv == ["inspect"] and len(sys.argv) <= 1:
+        _pause_if_double_clicked()
+    return code
 
 
 if __name__ == "__main__":
